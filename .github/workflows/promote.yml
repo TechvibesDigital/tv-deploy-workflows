@@ -1,0 +1,261 @@
+name: TV — Promote Staging → Production (callable)
+
+# Workflow RÉUTILISABLE TechVibes pour promotion COMPLÈTE staging→prod.
+# Appelé depuis un projet client via `uses: TechvibesDigital/tv-deploy-workflows/.github/workflows/promote.yml@v1`.
+#
+# Flow :
+#   1. Guard               — confirm == DEPLOY
+#   2. Backup release prod  — DB + code (httpdocs sans uploads) dans <site>/releases/, rotation 3 [BLOQUANT]
+#   3. Rsync FULL           — staging → prod (code + uploads), sans wp-config/.env/.ddev/.htaccess
+#   4. DB                   — staging → prod + search-replace STAGING_URL → PROD_URL (obligatoire)
+#   5. Post-deploy prod     — search-replace, caches, perms
+#   6. Healthcheck + récap + notif Telegram
+#
+# Transfert staging → prod : rsync DIRECT via SSH agent forwarding.
+# Pré-requis côté infra : le serveur staging peut SSH vers la prod.
+
+on:
+  workflow_call:
+    inputs:
+      confirm:
+        description: "Doit valoir DEPLOY (sinon abort)"
+        type: string
+        required: true
+      sync_database:
+        description: "Inclure la BDD (search-replace auto)"
+        type: boolean
+        required: false
+        default: true
+      sync_uploads:
+        description: "Inclure les uploads (médias)"
+        type: boolean
+        required: false
+        default: true
+      dry_run:
+        description: "Simulation (rsync -n, pas d'import DB, backup conservé)"
+        type: boolean
+        required: false
+        default: false
+      workflows_ref:
+        description: "Tag/SHA de tv-deploy-workflows utilisé pour charger les scripts (default v1)"
+        type: string
+        required: false
+        default: v1
+    secrets:
+      STAGING_SSH_KEY:
+        required: true
+      STAGING_HOST:
+        required: true
+      STAGING_USER:
+        required: true
+      STAGING_PATH:
+        required: true
+      STAGING_SSH_PORT:
+        required: false
+      PROD_HOST:
+        required: true
+      PROD_USER:
+        required: true
+      PROD_PATH:
+        required: true
+      PROD_SSH_PORT:
+        required: false
+      TELEGRAM_BOT_URL:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+# Empêche 2 promotions prod simultanées sur le même repo client.
+# cancel-in-progress=false → on attend la fin du run en cours plutôt que de l'interrompre
+# au milieu d'un import DB (risque de corruption).
+concurrency:
+  group: promote-prod-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier la confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::Confirmation must be 'DEPLOY'"
+            exit 1
+          fi
+
+  promote:
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      STAGING_PORT: ${{ secrets.STAGING_SSH_PORT || '22' }}
+      PROD_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+      STAGING_TARGET: ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }}
+      PROD_TARGET: ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }}
+    steps:
+      # On checkout UNIQUEMENT le repo tv-deploy-workflows (pour les scripts).
+      # Le repo client n'a pas besoin d'être checkouté : tout se fait via SSH.
+      # TODO: pin par SHA pour sécurité supply-chain.
+      - name: Checkout tv-deploy-workflows (scripts)
+        uses: actions/checkout@v4 # v4.x
+        with:
+          repository: TechvibesDigital/tv-deploy-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _tv_deploy
+
+      # Une seule clé (github-actions-deploy) autorisée sur staging ET prod.
+      # Via `ssh -A`, elle est forwardée jusqu'à staging pour atteindre prod.
+      # TODO: pin par SHA pour sécurité supply-chain
+      - name: Setup SSH (clé github-actions-deploy)
+        uses: webfactory/ssh-agent@v0.9.0 # v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
+
+      - name: Ajouter les hôtes à known_hosts
+        run: |
+          ssh-keyscan -p "$STAGING_PORT" -H "${{ secrets.STAGING_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -p "$PROD_PORT" -H "${{ secrets.PROD_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # === 1. Backup release prod + résolution des URLs (BLOQUANT) ===
+      # On résout les 2 URLs du search-replace SANS dépendre des secrets (parfois faux) :
+      #  - STAGING_URL = home RÉEL de staging = les URLs réellement dans le dump importé.
+      #  - PROD_URL    = dérivé du chemin Plesk (stable). On NE lit PAS wp option get home
+      #                  sur prod : un run précédent raté peut avoir corrompu sa DB.
+      - name: Backup release prod + résoudre URLs (staging→prod)
+        run: |
+          TS=$(date +%Y-%m-%d_%H%M%S)
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-backup.sh "$PROD_TARGET:/tmp/promote-prod-backup.sh"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'bash /tmp/promote-prod-backup.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$TS'"
+          PROD_URL="https://$(basename "$(dirname '${{ secrets.PROD_PATH }}')")"
+          STAGING_URL=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'wp --path=\"\$0\" option get home' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
+          [ -z "$STAGING_URL" ] && { echo "::error::STAGING_URL introuvable (wp option get home staging vide)"; exit 1; }
+          echo "PROD_URL=$PROD_URL" >> "$GITHUB_ENV"
+          echo "STAGING_URL=$STAGING_URL" >> "$GITHUB_ENV"
+          echo "✓ search-replace prévu : $STAGING_URL → $PROD_URL"
+
+      # === 1bis. Vérifier la compatibilité des table_prefix (P0) ===
+      - name: Vérifier table_prefix staging == prod
+        if: ${{ inputs.sync_database }}
+        run: |
+          PFX_PROD=$(ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" config get table_prefix' '${{ secrets.PROD_PATH }}'" | tr -d '\r')
+          PFX_STG=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'wp --path=\"\$0\" config get table_prefix' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
+          echo "staging='$PFX_STG'  prod='$PFX_PROD'"
+          if [ -z "$PFX_PROD" ] || [ -z "$PFX_STG" ]; then
+            echo "::error::table_prefix illisible (staging='$PFX_STG' prod='$PFX_PROD')"; exit 1
+          fi
+          if [ "$PFX_PROD" != "$PFX_STG" ]; then
+            echo "::error::table_prefix divergent (staging=$PFX_STG, prod=$PFX_PROD) — promotion annulée. Aligne les prefixes d'abord."; exit 1
+          fi
+          echo "✓ table_prefix cohérent : $PFX_STG"
+
+      # === 1ter. Maintenance mode ON (atomicité pendant rsync + import) ===
+      - name: Maintenance mode ON (prod)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
+          echo "✓ Prod en maintenance"
+
+      # === 2. Push code staging → prod (rsync direct, full) ===
+      - name: Rsync FULL staging → prod (code + uploads)
+        run: |
+          scp -P "$STAGING_PORT" _tv_deploy/scripts/promote-rsync.sh "$STAGING_TARGET:/tmp/promote-rsync.sh"
+          ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" \
+            "bash -lc 'bash /tmp/promote-rsync.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ inputs.sync_uploads }}' '${{ secrets.STAGING_PATH }}' '${{ inputs.dry_run }}'"
+
+      # === 3. Push BDD staging → prod (pipe direct) ===
+      - name: Push BDD staging → prod
+        if: ${{ inputs.sync_database && !inputs.dry_run }}
+        run: |
+          scp -P "$STAGING_PORT" _tv_deploy/scripts/promote-db.sh "$STAGING_TARGET:/tmp/promote-db.sh"
+          ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" \
+            "bash -lc 'bash /tmp/promote-db.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ secrets.STAGING_PATH }}'"
+
+      # === 4. Post-deploy prod (search-replace OBLIGATOIRE + caches + perms) ===
+      - name: Post-deploy prod (search-replace + caches)
+        if: ${{ inputs.sync_database && !inputs.dry_run }}
+        run: |
+          scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-postdeploy.sh "$PROD_TARGET:/tmp/promote-prod-postdeploy.sh"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL'" | tee /tmp/postdeploy.out
+          REPL_COUNT=$(grep -oE 'Made [0-9]+ replacement' /tmp/postdeploy.out | awk '{s+=$2} END{print s+0}')
+          echo "REPL_COUNT=$REPL_COUNT" >> "$GITHUB_ENV"
+          echo "✓ Total replacements WP-CLI : $REPL_COUNT"
+
+      # === 4bis. Si DB non synchronisée : flush caches + perms quand même ===
+      - name: Flush caches + perms (sans DB)
+        if: ${{ !inputs.sync_database && !inputs.dry_run }}
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc '
+            cd ${{ secrets.PROD_PATH }} && \
+            wp cache flush 2>/dev/null || true; \
+            wp rewrite flush --hard 2>/dev/null || true; \
+            wp elementor flush_css 2>/dev/null || true; \
+            find wp-content -type f -exec chmod 644 {} \; 2>/dev/null || true; \
+            find wp-content -type d -exec chmod 755 {} \; 2>/dev/null || true'"
+
+      # === 5. Maintenance mode OFF — TOUJOURS (remet en ligne même si échec) ===
+      - name: Maintenance mode OFF (prod)
+        if: ${{ always() && !inputs.dry_run }}
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
+          echo "✓ Prod de nouveau en ligne"
+
+      # === 6. Healthcheck prod (3 tentatives) ===
+      - name: Healthcheck prod
+        if: ${{ !inputs.dry_run }}
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 10 "$PROD_URL" || echo "000")
+            echo "Tentative $i : HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "::error::Prod ne répond pas 200 après 3 tentatives ($PROD_URL)"
+          exit 1
+
+      # === 7. Récap GITHUB_STEP_SUMMARY (toujours) ===
+      - name: Récap promote (summary)
+        if: always()
+        run: |
+          MODE="réel"; [ "${{ inputs.dry_run }}" = "true" ] && MODE="dry_run"
+          {
+            echo "## Promote staging → prod — ${{ github.repository }}"
+            echo ""
+            echo "| Champ | Valeur |"
+            echo "|-------|--------|"
+            echo "| Status | ${{ job.status }} |"
+            echo "| Mode | ${MODE} |"
+            echo "| Acteur | @${{ github.actor }} |"
+            echo "| Backup release | \`releases/*_${TS}\` |"
+            echo "| URLs | \`${STAGING_URL:-?}\` → \`${PROD_URL:-?}\` |"
+            echo "| Replacements | \`${REPL_COUNT:-0}\` |"
+            echo "| Run | https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notification Telegram
+        if: always() && env.TELEGRAM_BOT_URL != ''
+        env:
+          TELEGRAM_BOT_URL: ${{ secrets.TELEGRAM_BOT_URL }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS_EMOJI="✅"; [ "${{ job.status }}" != "success" ] && STATUS_EMOJI="❌"
+          MODE="réel"; [ "${{ inputs.dry_run }}" = "true" ] && MODE="dry_run"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="${STATUS_EMOJI} TechVibes — PROMOTE Staging→Prod"
+          TEXT="${TEXT}%0Arepo: ${{ github.repository }}"
+          TEXT="${TEXT}%0Aacteur: @${{ github.actor }}"
+          TEXT="${TEXT}%0Astatus: ${{ job.status }} (mode: ${MODE})"
+          TEXT="${TEXT}%0Aprod: ${PROD_URL:-?}"
+          TEXT="${TEXT}%0Abackup: releases/*_${TS}"
+          TEXT="${TEXT}%0Areplacements: ${REPL_COUNT:-0}"
+          TEXT="${TEXT}%0Arun: ${RUN_URL}"
+          curl -fsS -X POST "${TELEGRAM_BOT_URL}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "parse_mode=HTML" || true

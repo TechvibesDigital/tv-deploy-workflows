@@ -1,0 +1,193 @@
+name: TV — Rollback Production (callable)
+
+# Workflow RÉUTILISABLE TechVibes pour restaurer une release backup créée
+# par promote.yml (cf. scripts/promote-prod-backup.sh).
+# Appelé depuis un projet client via `uses: TechvibesDigital/tv-deploy-workflows/.github/workflows/rollback.yml@v1`.
+#
+# Flow :
+#   1. Guard               — confirm == ROLLBACK + au moins un toggle true
+#   2. Lister releases dispo + vérifier que release_name existe
+#   3. Maintenance mode ON
+#   4. Restauration code   (tar xzf, uploads préservés) [optionnel]
+#   5. Restauration DB     (gunzip | wp db import)      [optionnel]
+#   6. Flush caches + Elementor
+#   7. Maintenance mode OFF (always())
+#   8. Healthcheck (curl 3 tentatives)
+#   9. Notification Telegram
+
+on:
+  workflow_call:
+    inputs:
+      confirm:
+        description: "Doit valoir ROLLBACK (sinon abort)"
+        type: string
+        required: true
+      release_name:
+        description: "Nom du dossier release (ex: tech-o.pro_2026-05-28_103256)"
+        type: string
+        required: true
+      restore_db:
+        description: "Restaurer la base de données"
+        type: boolean
+        required: false
+        default: true
+      restore_code:
+        description: "Restaurer le code (httpdocs sans uploads)"
+        type: boolean
+        required: false
+        default: true
+      workflows_ref:
+        description: "Tag/SHA de tv-deploy-workflows utilisé pour charger les scripts (default v1)"
+        type: string
+        required: false
+        default: v1
+    secrets:
+      STAGING_SSH_KEY:
+        required: true
+      PROD_HOST:
+        required: true
+      PROD_USER:
+        required: true
+      PROD_PATH:
+        required: true
+      PROD_SSH_PORT:
+        required: false
+      TELEGRAM_BOT_URL:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+concurrency:
+  group: rollback-prod-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier la confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "ROLLBACK" ]; then
+            echo "::error::Confirmation must be 'ROLLBACK'"
+            exit 1
+          fi
+          if [ "${{ inputs.restore_db }}" != "true" ] && [ "${{ inputs.restore_code }}" != "true" ]; then
+            echo "::error::Au moins un des deux (restore_db ou restore_code) doit être true"
+            exit 1
+          fi
+
+  rollback:
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      PROD_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+      PROD_TARGET: ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }}
+      RELEASE_NAME: ${{ inputs.release_name }}
+    steps:
+      # TODO: pin par SHA pour sécurité supply-chain.
+      - name: Checkout tv-deploy-workflows (scripts)
+        uses: actions/checkout@v4 # v4.x
+        with:
+          repository: TechvibesDigital/tv-deploy-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _tv_deploy
+
+      - name: Setup SSH (clé github-actions-deploy)
+        uses: webfactory/ssh-agent@v0.9.0 # v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
+
+      - name: Ajouter prod à known_hosts
+        run: |
+          ssh-keyscan -p "$PROD_PORT" -H "${{ secrets.PROD_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # === 1. Lister les releases dispo + vérifier que release_name existe ===
+      - name: Lister releases prod et vérifier la cible
+        run: |
+          echo "▶ Releases disponibles sur prod :"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'ls -1dt \"\$0\"/releases/*/ 2>/dev/null || echo \"(aucune release)\"' '$(dirname "${{ secrets.PROD_PATH }}")'"
+          echo ""
+          echo "▶ Vérification de la release demandée : ${RELEASE_NAME}"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'test -d \"\$0/releases/\$1\" || { echo \"::error::Release introuvable : \$0/releases/\$1\"; exit 1; }' '$(dirname "${{ secrets.PROD_PATH }}")' '${RELEASE_NAME}'"
+          echo "✓ Release trouvée : ${RELEASE_NAME}"
+
+      # === 2. Maintenance mode ON (atomicité pendant la restauration) ===
+      - name: Maintenance mode ON (prod)
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
+          echo "✓ Prod en maintenance"
+
+      # === 3. Copie du script de rollback côté prod ===
+      - name: Pousser promote-rollback.sh sur prod
+        run: |
+          scp -P "$PROD_PORT" _tv_deploy/scripts/promote-rollback.sh "$PROD_TARGET:/tmp/promote-rollback.sh"
+
+      # === 4. Restauration code (httpdocs sans uploads) ===
+      - name: Restaurer le code
+        if: ${{ inputs.restore_code }}
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'code'"
+
+      # === 5. Restauration DB ===
+      - name: Restaurer la base de données
+        if: ${{ inputs.restore_db }}
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'db'"
+
+      # === 6. Flush caches + Elementor ===
+      - name: Flush caches + Elementor
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc '
+            cd ${{ secrets.PROD_PATH }} && \
+            wp cache flush 2>/dev/null || true; \
+            wp rewrite flush --hard 2>/dev/null || true; \
+            wp elementor flush_css 2>/dev/null || true'"
+
+      # === 7. Maintenance mode OFF — TOUJOURS (remet en ligne même si échec) ===
+      - name: Maintenance mode OFF (prod)
+        if: always()
+        run: |
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
+          echo "✓ Prod de nouveau en ligne"
+
+      # === 8. Healthcheck (3 tentatives) ===
+      - name: Healthcheck prod
+        run: |
+          PROD_URL="https://$(basename "$(dirname '${{ secrets.PROD_PATH }}')")"
+          echo "▶ Healthcheck : $PROD_URL"
+          OK=0
+          for i in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 15 "$PROD_URL" || echo "000")
+            echo "  tentative $i → HTTP $CODE"
+            if [ "$CODE" = "200" ] || [ "$CODE" = "301" ] || [ "$CODE" = "302" ]; then
+              OK=1; break
+            fi
+            sleep 5
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::Healthcheck KO sur $PROD_URL après 3 tentatives"
+            exit 1
+          fi
+          echo "✓ Healthcheck OK"
+
+      - name: Notification Telegram
+        if: always() && env.TELEGRAM_BOT_URL != ''
+        env:
+          TELEGRAM_BOT_URL: ${{ secrets.TELEGRAM_BOT_URL }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS_EMOJI="✅"; [ "${{ job.status }}" != "success" ] && STATUS_EMOJI="❌"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -fsS -X POST "${TELEGRAM_BOT_URL}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${STATUS_EMOJI} TechVibes — ROLLBACK Prod%0A${{ job.status }}%0Arelease: ${RELEASE_NAME}%0Apar: @${{ github.actor }}%0Arun: ${RUN_URL}" \
+            --data-urlencode "parse_mode=HTML" || true
