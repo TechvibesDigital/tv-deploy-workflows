@@ -41,6 +41,11 @@ on:
         type: string
         required: false
         default: v1
+      layout:
+        description: "Layout du projet : classic (httpdocs = WP) ou bedrock (httpdocs = racine Bedrock, docroot web/)"
+        type: string
+        required: false
+        default: classic
     secrets:
       STAGING_SSH_KEY:
         required: true
@@ -121,7 +126,7 @@ jobs:
       # === 2. Maintenance mode ON (atomicité pendant la restauration) ===
       - name: Maintenance mode ON (prod)
         run: |
-          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && wp maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
           echo "✓ Prod en maintenance"
 
       # === 3. Copie du script de rollback côté prod ===
@@ -134,14 +139,14 @@ jobs:
         if: ${{ inputs.restore_code }}
         run: |
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'code'"
+            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'code' '${{ inputs.layout }}'"
 
       # === 5. Restauration DB ===
       - name: Restaurer la base de données
         if: ${{ inputs.restore_db }}
         run: |
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'db'"
+            "bash -lc 'bash /tmp/promote-rollback.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '${RELEASE_NAME}' 'db' '${{ inputs.layout }}'"
 
       # === 6. Flush caches + Elementor ===
       - name: Flush caches + Elementor
@@ -156,7 +161,7 @@ jobs:
       - name: Maintenance mode OFF (prod)
         if: always()
         run: |
-          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && wp maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
           echo "✓ Prod de nouveau en ligne"
 
       # === 8. Healthcheck (3 tentatives) ===

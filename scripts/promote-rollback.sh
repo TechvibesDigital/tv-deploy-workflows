@@ -12,14 +12,23 @@
 # prod sont préservés (médias récents non écrasés).
 # =====================================================
 # Args:
-#   $1 = PROD_PATH      (httpdocs prod)
+#   $1 = PROD_PATH      (httpdocs prod ; layout bedrock = racine projet Bedrock)
 #   $2 = RELEASE_NAME   (ex: tech-o.pro_2026-05-28_103256)
 #   $3 = ACTION         (db | code)
+#   $4 = LAYOUT         (classic | bedrock — optionnel, défaut classic)
+#
+# NOTE layout : la restauration est layout-agnostique.
+#   - code : `tar xzf` écrase ce que l'archive contient (les excludes — uploads —
+#     ont été appliqués à la CRÉATION par promote-prod-backup.sh selon le layout).
+#   - db : `cd $PROD_PATH && wp db import` marche en classic ET en bedrock
+#     (wp-cli.yml à la racine Bedrock pointe path: web/wp). PAS de --path= ici.
 set -euo pipefail
 
 PROD_PATH="${1:?PROD_PATH requis}"
 RELEASE_NAME="${2:?RELEASE_NAME requis}"
 ACTION="${3:?ACTION requis (db | code)}"
+LAYOUT="${4:-classic}"
+echo "▶ Rollback (action=${ACTION}, layout=${LAYOUT})"
 
 SITE_DIR="$(dirname "$PROD_PATH")"          # ex: .../tech-o.pro
 RELEASES_DIR="${SITE_DIR}/releases"

@@ -98,6 +98,40 @@ jobs:
       restore_code: ${{ inputs.restore_code }}
 ```
 
+## Inputs des workflows
+
+### `promote.yml`
+
+| Input | Type | Défaut | Description |
+|-------|------|--------|-------------|
+| `confirm` | string | — (requis) | Doit valoir `DEPLOY` |
+| `sync_database` | boolean | `true` | Inclure la BDD (search-replace auto) |
+| `sync_uploads` | boolean | `true` | Inclure les uploads (médias) |
+| `dry_run` | boolean | `false` | Simulation (rsync -n, pas d'import DB) |
+| `workflows_ref` | string | `v1` | Tag/SHA de tv-deploy-workflows pour charger les scripts |
+| `layout` | string | `classic` | Layout du projet : `classic` ou `bedrock` (voir ci-dessous) |
+
+### `rollback.yml`
+
+| Input | Type | Défaut | Description |
+|-------|------|--------|-------------|
+| `confirm` | string | — (requis) | Doit valoir `ROLLBACK` |
+| `release_name` | string | — (requis) | Nom du dossier release (ex: `tech-o.pro_2026-05-28_103256`) |
+| `restore_db` | boolean | `true` | Restaurer la base de données |
+| `restore_code` | boolean | `true` | Restaurer le code (sans uploads) |
+| `workflows_ref` | string | `v1` | Tag/SHA de tv-deploy-workflows pour charger les scripts |
+| `layout` | string | `classic` | Layout du projet : `classic` ou `bedrock` (voir ci-dessous) |
+
+## Layout `classic` vs `bedrock`
+
+- **`classic`** (défaut, projets `techvibes-wp-import-existing`) : `STAGING_PATH`/`PROD_PATH` pointent un `httpdocs/` qui contient directement `wp-admin/`, `wp-content/`, `wp-config.php`. C'est le comportement historique — les stubs existants qui n'envoient pas l'input `layout` ne changent pas.
+- **`bedrock`** (projets `techvibes-wp-boilerplate`) : `STAGING_PATH`/`PROD_PATH` pointent la **racine du projet Bedrock** (qui contient `web/` = docroot avec `web/wp/` core et `web/app/` contenu, `config/`, `vendor/`, `composer.json`, `wp-cli.yml`, `.env`). Conséquences :
+  - le rsync de promotion ne pousse que `web/ config/ vendor/ composer.json composer.lock wp-cli.yml` — le `.env` prod n'est **jamais** écrasé ;
+  - les excludes backup/rsync visent `web/app/{uploads,cache,upgrade,wflogs}` au lieu de `wp-content/*` ;
+  - toutes les commandes WP-CLI sont exécutées via `cd <PATH> && wp …` (le `wp-cli.yml` à la racine pointe `path: web/wp` ; `wp --path=` ne marche pas en Bedrock).
+
+Stub côté client Bedrock : ajouter `layout: bedrock` dans le bloc `with:` des deux stubs.
+
 ## Secrets requis côté repo client
 
 `secrets: inherit` propage automatiquement les secrets du repo client au workflow réutilisable.
@@ -107,11 +141,11 @@ jobs:
 | `STAGING_SSH_KEY` | Clé SSH privée `github-actions-deploy` (autorisée sur staging ET prod) | ✅ |
 | `STAGING_HOST` | Hôte du serveur staging (ex: `tv-staging.ma`) | ✅ (promote) |
 | `STAGING_USER` | Utilisateur SSH staging (ex: `techvibes`) | ✅ (promote) |
-| `STAGING_PATH` | Chemin httpdocs staging | ✅ (promote) |
+| `STAGING_PATH` | Chemin httpdocs staging (racine projet Bedrock si `layout: bedrock`) | ✅ (promote) |
 | `STAGING_SSH_PORT` | Port SSH staging | ❌ (défaut 22) |
 | `PROD_HOST` | Hôte serveur prod client | ✅ |
 | `PROD_USER` | Utilisateur SSH prod | ✅ |
-| `PROD_PATH` | Chemin httpdocs prod (ex: `/var/www/vhosts/.../tech-o.pro/httpdocs`) | ✅ |
+| `PROD_PATH` | Chemin httpdocs prod (ex: `/var/www/vhosts/.../tech-o.pro/httpdocs` ; racine projet Bedrock si `layout: bedrock`) | ✅ |
 | `PROD_SSH_PORT` | Port SSH prod | ❌ (défaut 22) |
 | `TELEGRAM_BOT_URL` | URL du bot Telegram pour notifs | ❌ |
 | `TELEGRAM_CHAT_ID` | Chat ID Telegram | ❌ |

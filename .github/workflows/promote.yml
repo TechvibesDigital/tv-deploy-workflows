@@ -41,6 +41,11 @@ on:
         type: string
         required: false
         default: v1
+      layout:
+        description: "Layout du projet : classic (httpdocs = WP) ou bedrock (httpdocs = racine Bedrock, docroot web/)"
+        type: string
+        required: false
+        default: classic
     secrets:
       STAGING_SSH_KEY:
         required: true
@@ -131,9 +136,10 @@ jobs:
           echo "TS=$TS" >> "$GITHUB_ENV"
           scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-backup.sh "$PROD_TARGET:/tmp/promote-prod-backup.sh"
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-prod-backup.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$TS'"
+            "bash -lc 'bash /tmp/promote-prod-backup.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$TS' '${{ inputs.layout }}'"
           PROD_URL="https://$(basename "$(dirname '${{ secrets.PROD_PATH }}')")"
-          STAGING_URL=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'wp --path=\"\$0\" option get home' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
+          # cd + wp (et pas wp --path=) : compatible classic ET bedrock (wp-cli.yml → path: web/wp)
+          STAGING_URL=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'cd \"\$0\" && wp option get home' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
           [ -z "$STAGING_URL" ] && { echo "::error::STAGING_URL introuvable (wp option get home staging vide)"; exit 1; }
           echo "PROD_URL=$PROD_URL" >> "$GITHUB_ENV"
           echo "STAGING_URL=$STAGING_URL" >> "$GITHUB_ENV"
@@ -143,8 +149,10 @@ jobs:
       - name: Vérifier table_prefix staging == prod
         if: ${{ inputs.sync_database }}
         run: |
-          PFX_PROD=$(ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" config get table_prefix' '${{ secrets.PROD_PATH }}'" | tr -d '\r')
-          PFX_STG=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'wp --path=\"\$0\" config get table_prefix' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
+          # `wp config get table_prefix` ne marche pas en bedrock ($table_prefix est dans
+          # config/application.php, invisible au parsing statique) → fallback `wp db prefix`.
+          PFX_PROD=$(ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && { wp config get table_prefix 2>/dev/null || wp db prefix; }' '${{ secrets.PROD_PATH }}'" | tr -d '\r')
+          PFX_STG=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'cd \"\$0\" && { wp config get table_prefix 2>/dev/null || wp db prefix; }' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
           echo "staging='$PFX_STG'  prod='$PFX_PROD'"
           if [ -z "$PFX_PROD" ] || [ -z "$PFX_STG" ]; then
             echo "::error::table_prefix illisible (staging='$PFX_STG' prod='$PFX_PROD')"; exit 1
@@ -158,7 +166,7 @@ jobs:
       - name: Maintenance mode ON (prod)
         if: ${{ !inputs.dry_run }}
         run: |
-          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && wp maintenance-mode activate' '${{ secrets.PROD_PATH }}'" || true
           echo "✓ Prod en maintenance"
 
       # === 2. Push code staging → prod (rsync direct, full) ===
@@ -166,7 +174,7 @@ jobs:
         run: |
           scp -P "$STAGING_PORT" _tv_deploy/scripts/promote-rsync.sh "$STAGING_TARGET:/tmp/promote-rsync.sh"
           ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" \
-            "bash -lc 'bash /tmp/promote-rsync.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ inputs.sync_uploads }}' '${{ secrets.STAGING_PATH }}' '${{ inputs.dry_run }}'"
+            "bash -lc 'bash /tmp/promote-rsync.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ inputs.sync_uploads }}' '${{ secrets.STAGING_PATH }}' '${{ inputs.dry_run }}' '${{ inputs.layout }}'"
 
       # === 3. Push BDD staging → prod (pipe direct) ===
       - name: Push BDD staging → prod
@@ -174,7 +182,7 @@ jobs:
         run: |
           scp -P "$STAGING_PORT" _tv_deploy/scripts/promote-db.sh "$STAGING_TARGET:/tmp/promote-db.sh"
           ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" \
-            "bash -lc 'bash /tmp/promote-db.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ secrets.STAGING_PATH }}'"
+            "bash -lc 'bash /tmp/promote-db.sh \"\$@\"' _ '$PROD_TARGET' '${{ secrets.PROD_PATH }}' '$PROD_PORT' '${{ secrets.STAGING_PATH }}' '${{ inputs.layout }}'"
 
       # === 4. Post-deploy prod (search-replace OBLIGATOIRE + caches + perms) ===
       - name: Post-deploy prod (search-replace + caches)
@@ -182,7 +190,7 @@ jobs:
         run: |
           scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-postdeploy.sh "$PROD_TARGET:/tmp/promote-prod-postdeploy.sh"
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL'" | tee /tmp/postdeploy.out
+            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL' '${{ inputs.layout }}'" | tee /tmp/postdeploy.out
           REPL_COUNT=$(grep -oE 'Made [0-9]+ replacement' /tmp/postdeploy.out | awk '{s+=$2} END{print s+0}')
           echo "REPL_COUNT=$REPL_COUNT" >> "$GITHUB_ENV"
           echo "✓ Total replacements WP-CLI : $REPL_COUNT"
@@ -191,19 +199,21 @@ jobs:
       - name: Flush caches + perms (sans DB)
         if: ${{ !inputs.sync_database && !inputs.dry_run }}
         run: |
+          CONTENT_DIR="wp-content"
+          [ "${{ inputs.layout }}" = "bedrock" ] && CONTENT_DIR="web/app"
           ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc '
             cd ${{ secrets.PROD_PATH }} && \
             wp cache flush 2>/dev/null || true; \
             wp rewrite flush --hard 2>/dev/null || true; \
             wp elementor flush_css 2>/dev/null || true; \
-            find wp-content -type f -exec chmod 644 {} \; 2>/dev/null || true; \
-            find wp-content -type d -exec chmod 755 {} \; 2>/dev/null || true'"
+            find ${CONTENT_DIR} -type f -exec chmod 644 {} \; 2>/dev/null || true; \
+            find ${CONTENT_DIR} -type d -exec chmod 755 {} \; 2>/dev/null || true'"
 
       # === 5. Maintenance mode OFF — TOUJOURS (remet en ligne même si échec) ===
       - name: Maintenance mode OFF (prod)
         if: ${{ always() && !inputs.dry_run }}
         run: |
-          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'wp --path=\"\$0\" maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && wp maintenance-mode deactivate' '${{ secrets.PROD_PATH }}'" || true
           echo "✓ Prod de nouveau en ligne"
 
       # === 6. Healthcheck prod (3 tentatives) ===
@@ -231,6 +241,7 @@ jobs:
             echo "|-------|--------|"
             echo "| Status | ${{ job.status }} |"
             echo "| Mode | ${MODE} |"
+            echo "| Layout | ${{ inputs.layout }} |"
             echo "| Acteur | @${{ github.actor }} |"
             echo "| Backup release | \`releases/*_${TS}\` |"
             echo "| URLs | \`${STAGING_URL:-?}\` → \`${PROD_URL:-?}\` |"

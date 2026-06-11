@@ -9,16 +9,22 @@
 # =====================================================
 # Args:
 #   $1 = PROD_TARGET   (user@host)
-#   $2 = PROD_PATH     (httpdocs prod)
+#   $2 = PROD_PATH     (httpdocs prod ; layout bedrock = racine projet Bedrock)
 #   $3 = PROD_PORT     (défaut 22)
-#   $4 = STAGING_PATH  (httpdocs staging)
+#   $4 = STAGING_PATH  (httpdocs staging ; layout bedrock = racine projet Bedrock)
+#   $5 = LAYOUT        (classic | bedrock — optionnel, défaut classic)
+#
+# NOTE layout : `cd <path> && wp` (et PAS wp --path=) marche dans les deux
+# layouts — en bedrock, wp-cli.yml à la racine pointe path: web/wp.
 set -euo pipefail
 
 PROD_TARGET="${1:?PROD_TARGET requis}"
 PROD_PATH="${2:?PROD_PATH requis}"
 PROD_PORT="${3:-22}"
 STAGING_PATH="${4:?STAGING_PATH requis}"
+LAYOUT="${5:-classic}"
 
+echo "▶ Push DB staging → prod (layout=${LAYOUT})"
 cd "$STAGING_PATH"
 
 echo "▶ Export DB staging → import prod (pipe gzip, charset utf8mb4)..."
@@ -31,6 +37,6 @@ wp db export - --quiet --default-character-set=utf8mb4 \
   | sed -E 's/utf8mb4_uca1400_ai_ci/utf8mb4_general_ci/g; s/utf8mb3_uca1400_ai_ci/utf8mb3_general_ci/g; s/utf8_uca1400_ai_ci/utf8_general_ci/g; s/_uca1400_[a-z]+_c[is]/_general_ci/g' \
   | gzip \
   | ssh -p "${PROD_PORT}" -o StrictHostKeyChecking=accept-new "${PROD_TARGET}" \
-      "bash -lc 'gunzip | wp --path=\"\$0\" db import - --default-character-set=utf8mb4' '${PROD_PATH}'"
+      "bash -lc 'cd \"\$0\" && gunzip | wp db import - --default-character-set=utf8mb4' '${PROD_PATH}'"
 
 echo "✓ DB staging importée sur prod (search-replace à suivre)"
