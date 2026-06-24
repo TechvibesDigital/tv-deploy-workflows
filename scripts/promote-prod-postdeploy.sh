@@ -56,6 +56,12 @@ wp option update siteurl "$PROD_URL"
 # elementor_log peut garder des URLs dans des stack traces
 wp option update elementor_log "" 2>/dev/null || true
 
+# Lever la restriction d'indexation héritée du staging (CLAUDE.md §5.3).
+# Le staging est toujours noindex (blog_public=0) ; sans ça la prod reste
+# invisible de Google après chaque mise en prod (vécu : elka, sct-tolerie).
+echo "▶ blog_public → 1 (prod indexable)"
+wp option update blog_public 1
+
 echo "▶ Flush caches (on NE force PAS la structure de permaliens — on garde celle de la prod)"
 wp rewrite flush --hard 2>/dev/null || true
 wp cache flush 2>/dev/null || true
