@@ -46,6 +46,11 @@ on:
         type: string
         required: false
         default: classic
+      prod_url:
+        description: "URL prod explicite (ex: https://client.fr). Si vide, dérivée de PROD_PATH — INCORRECTE si webspace auto-nommé ou sans httpdocs."
+        type: string
+        required: false
+        default: ""
     secrets:
       STAGING_SSH_KEY:
         required: true
@@ -137,7 +142,16 @@ jobs:
           scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-backup.sh "$PROD_TARGET:/tmp/promote-prod-backup.sh"
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
             "bash -lc 'bash /tmp/promote-prod-backup.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$TS' '${{ inputs.layout }}'"
-          PROD_URL="https://$(basename "$(dirname '${{ secrets.PROD_PATH }}')")"
+          # PROD_URL : input explicite prioritaire, sinon dérivation du chemin Plesk
+          # (basename(dirname PROD_PATH)) — qui suppose httpdocs/ ET webspace = domaine.
+          # Faux si webspace auto-nommé (competent-ellis…) ou WP à la racine sans httpdocs.
+          PROD_URL="${{ inputs.prod_url }}"
+          if [ -z "$PROD_URL" ]; then
+            PROD_URL="https://$(basename "$(dirname '${{ secrets.PROD_PATH }}')")"
+            echo "⚠ PROD_URL dérivée de PROD_PATH : $PROD_URL — passe -f prod_url=... si incorrect"
+          else
+            echo "✓ PROD_URL explicite : $PROD_URL"
+          fi
           # cd + wp (et pas wp --path=) : compatible classic ET bedrock (wp-cli.yml → path: web/wp)
           STAGING_URL=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'cd \"\$0\" && wp option get home' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
           [ -z "$STAGING_URL" ] && { echo "::error::STAGING_URL introuvable (wp option get home staging vide)"; exit 1; }
@@ -220,13 +234,17 @@ jobs:
       - name: Healthcheck prod
         if: ${{ !inputs.dry_run }}
         run: |
-          for i in 1 2 3; do
+          # Laisse la bascule maintenance OFF + le cache se stabiliser (faux négatif
+          # vécu sur centre-expert : healthcheck testé trop tôt). 5 tentatives, et
+          # on accepte 200/301/302/401 (redirection www/https, basic auth) = site vivant.
+          sleep 8
+          for i in 1 2 3 4 5; do
             code=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 10 "$PROD_URL" || echo "000")
             echo "Tentative $i : HTTP $code"
-            [ "$code" = "200" ] && exit 0
-            sleep 5
+            case "$code" in 200|301|302|401) echo "✓ Prod répond ($code)"; exit 0 ;; esac
+            sleep 6
           done
-          echo "::error::Prod ne répond pas 200 après 3 tentatives ($PROD_URL)"
+          echo "::error::Prod ne répond pas (200/301/302/401) après 5 tentatives ($PROD_URL)"
           exit 1
 
       # === 7. Récap GITHUB_STEP_SUMMARY (toujours) ===
