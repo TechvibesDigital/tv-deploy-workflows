@@ -29,9 +29,31 @@ REL="${RELEASES_DIR}/${SITE_NAME}_${TS}"
 mkdir -p "$REL"
 cd "$PROD_PATH"
 
-echo "▶ Backup DB prod → ${REL}/db.sql.gz"
-wp db export "${REL}/db.sql" --quiet
-gzip -f "${REL}/db.sql"
+# Première mise en ligne : webspace fraîchement créé, pas de WordPress → rien à
+# sauvegarder n'est PAS une erreur. On ne saute le backup DB que si la config WP
+# est réellement ABSENTE : un WP présent mais cassé doit continuer à bloquer la
+# promotion (c'est le filet anti-écrasement d'un site existant).
+WP_PRESENT=1
+if [ "$LAYOUT" = "bedrock" ]; then
+  [ -f "config/application.php" ] || WP_PRESENT=0
+else
+  { [ -f "wp-config.php" ] || [ -f "../wp-config.php" ]; } || WP_PRESENT=0
+fi
+
+if [ "$WP_PRESENT" = "1" ]; then
+  echo "▶ Backup DB prod → ${REL}/db.sql.gz"
+  wp db export "${REL}/db.sql" --quiet
+  gzip -f "${REL}/db.sql"
+else
+  echo "⚠ Pas de WordPress dans ${PROD_PATH} (première mise en ligne ?) — backup DB sauté"
+fi
+
+if [ -z "$(ls -A "$PROD_PATH" 2>/dev/null)" ]; then
+  echo "⚠ Docroot vide — backup code sauté"
+  rmdir "$REL" 2>/dev/null || true
+  echo "✓ Rien à sauvegarder : promotion autorisée sans release (première mise en ligne)"
+  exit 0
+fi
 
 echo "▶ Backup code (layout=${LAYOUT}, SANS uploads) → ${REL}/code.tar.gz"
 # Excludes selon layout : classic = wp-content/*, bedrock = web/app/*.
