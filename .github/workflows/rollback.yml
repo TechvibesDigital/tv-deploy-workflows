@@ -94,16 +94,15 @@ jobs:
       PROD_TARGET: ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }}
       RELEASE_NAME: ${{ inputs.release_name }}
     steps:
-      # TODO: pin par SHA pour sécurité supply-chain.
       - name: Checkout tv-deploy-workflows (scripts)
-        uses: actions/checkout@v4 # v4.x
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: TechvibesDigital/tv-deploy-workflows
           ref: ${{ inputs.workflows_ref }}
           path: _tv_deploy
 
       - name: Setup SSH (clé github-actions-deploy)
-        uses: webfactory/ssh-agent@v0.9.0 # v0.9.0
+        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
         with:
           ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
 
