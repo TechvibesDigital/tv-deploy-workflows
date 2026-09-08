@@ -157,22 +157,41 @@ jobs:
           echo "STAGING_URL=$STAGING_URL" >> "$GITHUB_ENV"
           echo "✓ search-replace prévu : $STAGING_URL → $PROD_URL"
 
-      # === 1bis. Vérifier la compatibilité des table_prefix (P0) ===
-      - name: Vérifier table_prefix staging == prod
+      # === 1bis. Préparer la prod : aligner le table_prefix + poser le témoin ===
+      # On PRÉPARE au lieu de refuser : la base prod est remplacée par celle du
+      # staging, donc son prefix d'origine ne survit pas de toute façon. Exiger
+      # qu'il soit déjà identique imposait une correction manuelle à chaque
+      # première mise en ligne (Plesk tire un prefix aléatoire par installation).
+      - name: Préparer la prod (table_prefix + témoin docroot)
         if: ${{ inputs.sync_database }}
         run: |
-          # `wp config get table_prefix` ne marche pas en bedrock ($table_prefix est dans
-          # config/application.php, invisible au parsing statique) → fallback `wp db prefix`.
-          PFX_PROD=$(ssh -p "$PROD_PORT" "$PROD_TARGET" "bash -lc 'cd \"\$0\" && { wp config get table_prefix 2>/dev/null || wp db prefix; }' '${{ secrets.PROD_PATH }}'" | tr -d '\r')
-          PFX_STG=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'cd \"\$0\" && { wp config get table_prefix 2>/dev/null || wp db prefix; }' '${{ secrets.STAGING_PATH }}'" | tr -d '\r')
-          echo "staging='$PFX_STG'  prod='$PFX_PROD'"
-          if [ -z "$PFX_PROD" ] || [ -z "$PFX_STG" ]; then
-            echo "::error::table_prefix illisible (staging='$PFX_STG' prod='$PFX_PROD')"; exit 1
+          PFX_STG=$(ssh -A -p "$STAGING_PORT" "$STAGING_TARGET" "bash -lc 'cd \"\$0\" && { wp config get table_prefix 2>/dev/null || wp db prefix; }' '${{ secrets.STAGING_PATH }}'" | tr -d '\r' | tr -d '[:space:]')
+          [ -n "$PFX_STG" ] || { echo "::error::table_prefix du staging illisible"; exit 1; }
+          MARKER="tv-promote-check-${TS}.txt"
+          echo "MARKER=$MARKER" >> "$GITHUB_ENV"
+          scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-prepare.sh "$PROD_TARGET:/tmp/promote-prod-prepare.sh"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" \
+            "bash -lc 'bash /tmp/promote-prod-prepare.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$PFX_STG' '$TS' '${{ inputs.layout }}' '$MARKER'"
+
+      # === 1ter. Le docroot servi est-il bien PROD_PATH ? ===
+      # Vécu sur lafermedesperrelles : promotion réussie de bout en bout, mais
+      # Document root Plesk réglé sur la racine du domaine → 403, le site
+      # déployé restait invisible. On le détecte AVANT de toucher à la prod.
+      - name: Vérifier que le docroot servi correspond à PROD_PATH
+        if: ${{ inputs.sync_database }}
+        run: |
+          if ! getent hosts "$(printf '%s' "$PROD_URL" | sed -E 's#^https?://##; s#/.*##')" >/dev/null 2>&1; then
+            echo "⚠ DNS non résolu pour ${PROD_URL} — contrôle du docroot impossible (domaine pas encore pointé ?), on continue"
+            exit 0
           fi
-          if [ "$PFX_PROD" != "$PFX_STG" ]; then
-            echo "::error::table_prefix divergent (staging=$PFX_STG, prod=$PFX_PROD) — promotion annulée. Aligne les prefixes d'abord."; exit 1
+          BODY=$(curl -sS -L --max-time 20 "${PROD_URL}/${MARKER}" 2>/dev/null || true)
+          if printf '%s' "$BODY" | grep -q "tv-promote ${TS}"; then
+            echo "✓ Le serveur sert bien ${{ secrets.PROD_PATH }}"
+          else
+            echo "::error::Le docroot servi ne correspond PAS à PROD_PATH : ${PROD_URL}/${MARKER} est introuvable alors que le fichier vient d'être posé dans ${{ secrets.PROD_PATH }}."
+            echo "::error::Corrige le Document root du domaine dans Plesk (Hosting Settings → Document root : <domaine>/httpdocs), puis relance. Rien n'a été déployé."
+            exit 1
           fi
-          echo "✓ table_prefix cohérent : $PFX_STG"
 
       # === 1ter. Maintenance mode ON (atomicité pendant rsync + import) ===
       - name: Maintenance mode ON (prod)
@@ -220,6 +239,14 @@ jobs:
             wp elementor flush_css 2>/dev/null || true; \
             find ${CONTENT_DIR} -type f -exec chmod 644 {} \; 2>/dev/null || true; \
             find ${CONTENT_DIR} -type d -exec chmod 755 {} \; 2>/dev/null || true'"
+
+      # === 4ter. Retrait du témoin de docroot (toujours) ===
+      - name: Retirer le témoin de docroot
+        if: ${{ always() && env.MARKER != '' }}
+        run: |
+          DOCROOT='${{ secrets.PROD_PATH }}'
+          [ "${{ inputs.layout }}" = "bedrock" ] && DOCROOT="${DOCROOT}/web"
+          ssh -p "$PROD_PORT" "$PROD_TARGET" "rm -f '${DOCROOT}/${MARKER}'" || true
 
       # === 5. Maintenance mode OFF — TOUJOURS (remet en ligne même si échec) ===
       - name: Maintenance mode OFF (prod)
