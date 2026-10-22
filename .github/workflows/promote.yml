@@ -51,6 +51,11 @@ on:
         type: string
         required: false
         default: ""
+      first_golive:
+        description: "Tout 1er go-live du projet : sème podium+client depuis le staging. Défaut false = on préserve les users de la prod (cas sûr, normal)."
+        type: boolean
+        required: false
+        default: false
     secrets:
       STAGING_SSH_KEY:
         required: true
@@ -221,7 +226,7 @@ jobs:
         run: |
           scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-postdeploy.sh "$PROD_TARGET:/tmp/promote-prod-postdeploy.sh"
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL' '${{ inputs.layout }}'" | tee /tmp/postdeploy.out
+            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL' '${{ inputs.layout }}' '$TS' '${{ inputs.first_golive }}'" | tee /tmp/postdeploy.out
           REPL_COUNT=$(grep -oE 'Made [0-9]+ replacement' /tmp/postdeploy.out | awk '{s+=$2} END{print s+0}')
           echo "REPL_COUNT=$REPL_COUNT" >> "$GITHUB_ENV"
           echo "✓ Total replacements WP-CLI : $REPL_COUNT"

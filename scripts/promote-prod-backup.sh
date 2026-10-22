@@ -44,8 +44,21 @@ if [ "$WP_PRESENT" = "1" ]; then
   echo "▶ Backup DB prod → ${REL}/db.sql.gz"
   wp db export "${REL}/db.sql" --quiet
   gzip -f "${REL}/db.sql"
+
+  # Snapshot ciblé des users prod (pré-import) + leur prefix d'origine. Rejoué
+  # APRÈS l'import par promote-prod-postdeploy.sh pour rendre la table users à son
+  # propriétaire : sans lui, l'import de la DB staging écrase podium (login
+  # "dev_xxxx" côté client) et le compte client avec le mot de passe du registre
+  # TechVibes, et nos comptes d'intégration fuitent en prod. La base prod sera
+  # réalignée sur le prefix du staging (promote-prod-prepare.sh), donc on garde
+  # ici le prefix d'origine pour réécrire les noms de tables au restore. Clé
+  # partout : le domaine email, jamais le login. Non compressé : table petite.
+  PFX_ORIG="$(wp db prefix 2>/dev/null | tr -d '[:space:]')"; PFX_ORIG="${PFX_ORIG:-wp_}"
+  echo "$PFX_ORIG" > "${REL}/prod-users.prefix"
+  echo "▶ Snapshot users prod → ${REL}/prod-users.sql (prefix ${PFX_ORIG})"
+  wp db export "${REL}/prod-users.sql" --tables="${PFX_ORIG}users,${PFX_ORIG}usermeta" --quiet
 else
-  echo "⚠ Pas de WordPress dans ${PROD_PATH} (première mise en ligne ?) — backup DB sauté"
+  echo "⚠ Pas de WordPress dans ${PROD_PATH} (première mise en ligne ?) — backup DB + users sauté"
 fi
 
 if [ -z "$(ls -A "$PROD_PATH" 2>/dev/null)" ]; then
