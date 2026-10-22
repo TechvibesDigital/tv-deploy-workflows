@@ -125,10 +125,19 @@ if [ -n "$TS" ]; then
     echo "▶ Restauration des users prod (leurs comptes, leurs mots de passe)"
     PFX_ORIG="$(cat "${REL_DIR}/prod-users.prefix" 2>/dev/null | tr -d '[:space:]')"; PFX_ORIG="${PFX_ORIG:-$PFX}"
     if [ "$PFX_ORIG" != "$PFX" ]; then
-      # Réécriture des noms de tables (prefix d'origine -> prefix courant), dans
+      # Réécriture des noms de tables (prefix d'origine -> prefix courant) dans
       # les backticks mysqldump (CREATE/DROP/INSERT/LOCK), avant réimport.
-      sed -E "s/\`${PFX_ORIG}(users|usermeta)\`/\`${PFX}\1\`/g" "$PROD_USERS_DUMP" | wp db import - \
-        || echo "::warning::restauration des users prod échouée (prefix réécrit), comptes laissés tels quels"
+      if sed -E "s/\`${PFX_ORIG}(users|usermeta)\`/\`${PFX}\1\`/g" "$PROD_USERS_DUMP" | wp db import -; then
+        # Les meta_key de rôle sont PRÉFIXÉS (${PFX_ORIG}capabilities,
+        # ${PFX_ORIG}user_level, ${PFX_ORIG}user-settings...). Après restauration
+        # ils gardent l'ancien prefix alors que WordPress tourne sur ${PFX} : sans
+        # ce réalignement, les comptes restaurés perdent leur rôle (plus d'admin).
+        # LIKE sans échappement du '_' : le prefix Plesk est aléatoire, aucune
+        # autre clé de usermeta ne commence par ${PFX_ORIG}.
+        wp db query "UPDATE ${PFX}usermeta SET meta_key = CONCAT('${PFX}', SUBSTRING(meta_key, LENGTH('${PFX_ORIG}')+1)) WHERE meta_key LIKE '${PFX_ORIG}%';" 2>/dev/null || true
+      else
+        echo "::warning::restauration des users prod échouée (prefix réécrit), comptes laissés tels quels"
+      fi
     else
       wp db import "$PROD_USERS_DUMP" \
         || echo "::warning::restauration des users prod échouée, comptes laissés tels quels"
