@@ -56,6 +56,11 @@ on:
         type: boolean
         required: false
         default: false
+      open_to_index:
+        description: "Ouvrir l'indexation Google. Défaut false = noindex (blog_public=0). Ne passer true QUE sur le go-live du domaine DÉFINITIF, jamais sur un domaine temporaire (.pro de preprod)."
+        type: boolean
+        required: false
+        default: false
     secrets:
       STAGING_SSH_KEY:
         required: true
@@ -226,7 +231,7 @@ jobs:
         run: |
           scp -P "$PROD_PORT" _tv_deploy/scripts/promote-prod-postdeploy.sh "$PROD_TARGET:/tmp/promote-prod-postdeploy.sh"
           ssh -p "$PROD_PORT" "$PROD_TARGET" \
-            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL' '${{ inputs.layout }}' '$TS' '${{ inputs.first_golive }}'" | tee /tmp/postdeploy.out
+            "bash -lc 'bash /tmp/promote-prod-postdeploy.sh \"\$@\"' _ '${{ secrets.PROD_PATH }}' '$STAGING_URL' '$PROD_URL' '${{ inputs.layout }}' '$TS' '${{ inputs.first_golive }}' '${{ inputs.open_to_index }}'" | tee /tmp/postdeploy.out
           REPL_COUNT=$(grep -oE 'Made [0-9]+ replacement' /tmp/postdeploy.out | awk '{s+=$2} END{print s+0}')
           echo "REPL_COUNT=$REPL_COUNT" >> "$GITHUB_ENV"
           echo "✓ Total replacements WP-CLI : $REPL_COUNT"
@@ -290,6 +295,7 @@ jobs:
             echo "| Status | ${{ job.status }} |"
             echo "| Mode | ${MODE} |"
             echo "| Layout | ${{ inputs.layout }} |"
+            echo "| Indexation | ${{ inputs.open_to_index && 'ouverte' || 'fermée (noindex)' }} |"
             echo "| Acteur | @${{ github.actor }} |"
             echo "| Backup release | \`releases/*_${TS}\` |"
             echo "| URLs | \`${STAGING_URL:-?}\` → \`${PROD_URL:-?}\` |"
@@ -309,6 +315,7 @@ jobs:
           TEXT="${STATUS_EMOJI} TechVibes — PROMOTE Staging→Prod"
           TEXT="${TEXT}%0Arepo: ${{ github.repository }}"
           TEXT="${TEXT}%0Aacteur: @${{ github.actor }}"
+          TEXT="${TEXT}%0Aindexation: ${{ inputs.open_to_index && 'OUVERTE' || 'fermée (noindex)' }}"
           TEXT="${TEXT}%0Astatus: ${{ job.status }} (mode: ${MODE})"
           TEXT="${TEXT}%0Aprod: ${PROD_URL:-?}"
           TEXT="${TEXT}%0Abackup: releases/*_${TS}"

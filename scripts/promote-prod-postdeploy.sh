@@ -12,6 +12,9 @@
 #   $2 = STAGING_URL  (ex: https://tech-o.tv-staging.ma)
 #   $3 = PROD_URL     (ex: https://tech-o.fr)
 #   $4 = LAYOUT       (classic | bedrock — optionnel, défaut classic)
+#   $5 = TS           (timestamp de la release, pour le snapshot users prod)
+#   $6 = FIRST_GOLIVE (true = tout 1er go-live ; défaut false)
+#   $7 = OPEN_TO_INDEX (true = ouvrir l'indexation Google ; défaut false = noindex)
 #
 # NOTE layout : toutes les commandes wp passent par `cd $PROD_PATH && wp`
 # (compatible bedrock via wp-cli.yml). Seuls le dossier contenu (wp-content
@@ -24,6 +27,7 @@ PROD_URL="${3:?PROD_URL requis}"
 LAYOUT="${4:-classic}"
 TS="${5:-}"                      # timestamp de la release (pour retrouver le snapshot users prod)
 FIRST_GOLIVE="${6:-false}"       # true = tout 1er go-live du projet (sème podium+client du staging)
+OPEN_TO_INDEX="${7:-false}"      # true = ouvrir l'indexation (domaine définitif) ; défaut false = noindex
 
 if [ "$LAYOUT" = "bedrock" ]; then
   CONTENT_DIR="web/app"   # équivalent wp-content en Bedrock
@@ -59,11 +63,20 @@ wp option update siteurl "$PROD_URL"
 # elementor_log peut garder des URLs dans des stack traces
 wp option update elementor_log "" 2>/dev/null || true
 
-# Lever la restriction d'indexation héritée du staging (CLAUDE.md §5.3).
-# Le staging est toujours noindex (blog_public=0) ; sans ça la prod reste
-# invisible de Google après chaque mise en prod (vécu : elka, sct-tolerie).
-echo "▶ blog_public → 1 (prod indexable)"
-wp option update blog_public 1
+# Indexation : FERMÉE par défaut. On n'ouvre à Google que sur le go-live du
+# domaine DÉFINITIF (open_to_index=true). Sur un domaine temporaire (ex: le
+# .pro de preprod client), laisser indexer pollue l'index avant le vrai domaine
+# (doublons, mauvais domaine en résultats). blog_public=0 suffit : WordPress
+# sort la meta noindex et un robots.txt Disallow tout seul.
+# Piège inverse (vécu elka, sct-tolerie) : une prod définitive reste invisible
+# si on oublie d'ouvrir ; d'où l'état affiché ici et dans le récap du run.
+if [ "$OPEN_TO_INDEX" = "true" ]; then
+  echo "▶ blog_public → 1 (indexation OUVERTE, domaine définitif)"
+  wp option update blog_public 1
+else
+  echo "▶ blog_public → 0 (indexation FERMÉE par défaut, noindex)"
+  wp option update blog_public 0
+fi
 
 # Outils de FABRICATION : utiles pendant l'intégration (suivi du travail des
 # intégrateurs), sans objet sur le site livré. Le rsync les apporte depuis le
